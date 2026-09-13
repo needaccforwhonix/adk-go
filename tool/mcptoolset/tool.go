@@ -24,9 +24,9 @@ import (
 
 	"google.golang.org/adk/v2/agent"
 	"google.golang.org/adk/v2/internal/toolinternal"
-	"google.golang.org/adk/v2/internal/toolinternal/toolutils"
 	"google.golang.org/adk/v2/model"
 	"google.golang.org/adk/v2/tool"
+	"google.golang.org/adk/v2/tool/toolutils"
 )
 
 func convertTool(t *mcp.Tool, client MCPClient, requireConfirmation bool, requireConfirmationProvider tool.ConfirmationProvider) (tool.Tool, error) {
@@ -117,7 +117,6 @@ func (t *mcpTool) Run(ctx agent.Context, args any) (map[string]any, error) {
 		}
 	}
 
-	// TODO: add auth
 	res, err := t.mcpClient.CallTool(ctx, &mcp.CallToolParams{
 		Name:      t.name,
 		Arguments: args,
@@ -153,10 +152,12 @@ func (t *mcpTool) Run(ctx agent.Context, args any) (map[string]any, error) {
 	}
 
 	textResponse := strings.Builder{}
+	droppedNonText := false
 
 	for _, c := range res.Content {
 		textContent, ok := c.(*mcp.TextContent)
 		if !ok {
+			droppedNonText = true
 			continue
 		}
 
@@ -165,8 +166,17 @@ func (t *mcpTool) Run(ctx agent.Context, args any) (map[string]any, error) {
 		}
 	}
 
-	if textResponse.Len() == 0 {
-		return nil, errors.New("no text content in tool response")
+	// A result that yields no text is a valid success (#1352) when there was no
+	// other content to lose: nothing at all, or only empty text blocks. When the
+	// text is empty because every block was non-text, returning {"output": ""}
+	// would report success while discarding the whole payload, so fail loudly
+	// instead.
+	//
+	// TODO(#1401): remove once non-text blocks are rendered rather than skipped.
+	// That also covers the mixed case this deliberately leaves alone, where a
+	// non-text block accompanies real text and is still dropped silently (#1391).
+	if textResponse.Len() == 0 && droppedNonText {
+		return nil, fmt.Errorf("tool %q returned only non-text content, which is not yet supported", t.name)
 	}
 
 	return map[string]any{
