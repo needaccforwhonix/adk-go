@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"iter"
 	"log"
+	"strings"
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
@@ -33,6 +34,8 @@ import (
 	"google.golang.org/adk/v2/model"
 	"google.golang.org/adk/v2/session"
 	"google.golang.org/adk/v2/tool"
+	"google.golang.org/adk/v2/tool/functiontool"
+	"google.golang.org/adk/v2/tool/toolauth"
 )
 
 type mockFunctionTool struct {
@@ -108,9 +111,24 @@ type testCase struct {
 	afterToolCallbacks   []AfterToolCallback
 	onToolErrorCallbacks []OnToolErrorCallback
 	want                 map[string]any
+	// check runs after the result has been compared, for a row that asserts on
+	// more than the result.
+	check func(t *testing.T)
 }
 
 func TestCallTool(t *testing.T) {
+	panicTool, err := functiontool.New(functiontool.Config{Name: "panicTool"}, func(agent.Context, struct{}) (struct{}, error) {
+		panic("boom")
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Callbacks run before the flow replaces the panic error with the generic
+	// message, so each one records the error it was handed for its own row's
+	// check to assert on. Each panic row gets its own map, so that a row only
+	// ever reads what its own callbacks recorded.
+	panicCallbackErrs := map[string]error{}
+	wrappedPanicCallbackErrs := map[string]error{}
 	testCases := []testCase{
 		{
 			name: "tool runs successfully",
@@ -133,6 +151,41 @@ func TestCallTool(t *testing.T) {
 			},
 			args: map[string]any{"key": "value"},
 			want: map[string]any{"error": "tool error"},
+		},
+		{
+			name: "tool panic is hidden from the model but not from callbacks",
+			tool: panicTool.(toolinternal.FunctionTool),
+			args: map[string]any{},
+			onToolErrorCallbacks: []OnToolErrorCallback{
+				func(ctx agent.Context, tool tool.Tool, args map[string]any, err error) (map[string]any, error) {
+					panicCallbackErrs["OnToolError"] = err
+					return nil, nil
+				},
+			},
+			afterToolCallbacks: []AfterToolCallback{
+				func(ctx agent.Context, tool tool.Tool, args, result map[string]any, err error) (map[string]any, error) {
+					panicCallbackErrs["AfterTool"] = err
+					return nil, nil
+				},
+			},
+			want:  map[string]any{"error": "Invoking `panicTool()` failed with an internal error."},
+			check: checkPanicCallbackErrs(panicCallbackErrs, "OnToolError", "AfterTool"),
+		},
+		{
+			// An error on its way out of a tool is wrapped more than once:
+			// agenttool wraps what the sub-agent run returned, and a callback
+			// that handles the error and returns its own is free to wrap it.
+			name: "wrapped tool panic is hidden from the model",
+			tool: panicTool.(toolinternal.FunctionTool),
+			args: map[string]any{},
+			onToolErrorCallbacks: []OnToolErrorCallback{
+				func(ctx agent.Context, tool tool.Tool, args map[string]any, err error) (map[string]any, error) {
+					wrappedPanicCallbackErrs["OnToolError"] = err
+					return nil, fmt.Errorf("lookup failed: %w", err)
+				},
+			},
+			want:  map[string]any{"error": "Invoking `panicTool()` failed with an internal error."},
+			check: checkPanicCallbackErrs(wrappedPanicCallbackErrs, "OnToolError"),
 		},
 		{
 			name: "before callback returns result",
@@ -431,7 +484,35 @@ func TestCallTool(t *testing.T) {
 			if diff := cmp.Diff(tc.want, got); diff != "" {
 				t.Errorf("callTool() mismatch (-want +got):\n%s", diff)
 			}
+			if tc.check != nil {
+				tc.check(t)
+			}
 		})
+	}
+}
+
+// checkPanicCallbackErrs asserts that a callback of each of the given kinds
+// recorded itself in errs, and was handed the panic value and the stack, which
+// callbacks need to diagnose a panic the model only sees as a generic message.
+func checkPanicCallbackErrs(errs map[string]error, kinds ...string) func(t *testing.T) {
+	return func(t *testing.T) {
+		t.Helper()
+		for _, kind := range kinds {
+			err, ok := errs[kind]
+			if !ok {
+				t.Errorf("%s callback was not called for the panic", kind)
+				continue
+			}
+			if err == nil {
+				t.Errorf("%s callback got a nil error for the panic", kind)
+				continue
+			}
+			for _, want := range []string{"boom", "stack:", "runtime/debug.Stack"} {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("%s callback error is missing %q", kind, want)
+				}
+			}
+		}
 	}
 }
 
@@ -737,6 +818,34 @@ func TestMergeEventActions(t *testing.T) {
 				Escalate:          true,
 			},
 		},
+		{
+			// Each parallel call records its own request under its own call ID,
+			// and the user has to answer all of them.
+			name: "requested auth configs from both calls kept",
+			base: &session.EventActions{
+				RequestedAuthConfigs: map[string]toolauth.Config{"call-a": {CredentialKey: "key-a"}},
+			},
+			other: &session.EventActions{
+				RequestedAuthConfigs: map[string]toolauth.Config{"call-b": {CredentialKey: "key-b"}},
+			},
+			want: &session.EventActions{
+				RequestedAuthConfigs: map[string]toolauth.Config{
+					"call-a": {CredentialKey: "key-a"},
+					"call-b": {CredentialKey: "key-b"},
+				},
+			},
+		},
+		{
+			name: "requested auth configs kept when only the later call asks",
+			base: &session.EventActions{StateDelta: map[string]any{"key1": "value1"}},
+			other: &session.EventActions{
+				RequestedAuthConfigs: map[string]toolauth.Config{"call-b": {CredentialKey: "key-b"}},
+			},
+			want: &session.EventActions{
+				StateDelta:           map[string]any{"key1": "value1"},
+				RequestedAuthConfigs: map[string]toolauth.Config{"call-b": {CredentialKey: "key-b"}},
+			},
+		},
 	}
 
 	for _, tc := range tests {
@@ -937,6 +1046,77 @@ func (m *alwaysThinkingModel) GenerateContent(ctx context.Context, req *model.LL
 				Parts: []*genai.Part{{Text: fmt.Sprintf("thinking %d", m.calls), Thought: true}},
 			},
 		}, nil)
+	}
+}
+
+// TestCallLLMStreamingModeFromRunConfig pins how callLLM derives the streaming
+// flag, including the nil case (issue #586).
+//
+// None of these store a runconfig in the Go context, as when agent.Run() is
+// invoked directly and the runner is bypassed, so runconfig.FromContext would
+// return nil; the streaming mode is read from the invocation context instead.
+// An invocation context built outside the runner need not carry a RunConfig at
+// all, and that has to resolve to false rather than panic.
+func TestCallLLMStreamingModeFromRunConfig(t *testing.T) {
+	tests := []struct {
+		name      string
+		runConfig *agent.RunConfig
+		want      bool
+	}{
+		{
+			name:      "SSE streams",
+			runConfig: &agent.RunConfig{StreamingMode: agent.StreamingModeSSE},
+			want:      true,
+		},
+		{
+			name:      "none does not stream",
+			runConfig: &agent.RunConfig{StreamingMode: agent.StreamingModeNone},
+			want:      false,
+		},
+		{
+			name:      "unset streaming mode does not stream",
+			runConfig: &agent.RunConfig{},
+			want:      false,
+		},
+		{
+			name:      "nil run config does not stream",
+			runConfig: nil,
+			want:      false,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			var calls int
+			var gotStream bool
+			m := &mockModelForTest{
+				name: "test-model",
+				generateContent: func(_ context.Context, _ *model.LLMRequest, stream bool) iter.Seq2[*model.LLMResponse, error] {
+					calls++
+					gotStream = stream
+					return func(func(*model.LLMResponse, error) bool) {}
+				},
+			}
+			f := &Flow{Model: m}
+
+			ctx := icontext.NewInvocationContext(t.Context(), icontext.InvocationContextParams{
+				RunConfig: tc.runConfig,
+			})
+
+			req := &model.LLMRequest{}
+			for _, err := range f.callLLM(ctx, req, map[string]any{}, map[string]int64{}) {
+				if err != nil {
+					t.Fatalf("callLLM() error = %v, want nil", err)
+				}
+			}
+
+			if calls != 1 {
+				t.Fatalf("GenerateContent called %d times, want 1", calls)
+			}
+			if gotStream != tc.want {
+				t.Errorf("GenerateContent received stream=%v, want %v", gotStream, tc.want)
+			}
+		})
 	}
 }
 
@@ -1222,4 +1402,120 @@ func captureLog(t *testing.T, fn func()) string {
 	})
 	fn()
 	return buf.String()
+}
+
+// dynamicToolset returns different tools on each call to simulate a toolset
+// whose output depends on session state written by an earlier tool in the run.
+type dynamicToolset struct {
+	callCount   int
+	toolsByCall map[int][]tool.Tool
+}
+
+func (d *dynamicToolset) Name() string { return "dynamic" }
+func (d *dynamicToolset) Tools(_ agent.ReadonlyContext) ([]tool.Tool, error) {
+	tools := d.toolsByCall[d.callCount]
+	d.callCount++
+	return tools, nil
+}
+
+// TestToolProcessorReEvaluatesToolsetsEachStep verifies that toolProcessor
+// calls Toolset.Tools() on every step, not just the first. This ensures that
+// tools activated by session-state changes in an earlier step are visible to
+// subsequent model calls within the same Runner.Run().
+func TestToolProcessorReEvaluatesToolsetsEachStep(t *testing.T) {
+	extraTool := &mockFunctionTool{name: "extra_tool"}
+
+	// Call 0: no tools yet. Call 1+: return extraTool.
+	ts := &dynamicToolset{
+		toolsByCall: map[int][]tool.Tool{
+			0: nil,
+			1: {extraTool},
+		},
+	}
+
+	baseTool := &mockFunctionTool{name: "base_tool"}
+	agentState := &State{Tools: []tool.Tool{baseTool}, Toolsets: []tool.Toolset{ts}}
+	mockAgent := &mockLLMAgent{s: agentState}
+	ctx := icontext.NewInvocationContext(t.Context(), icontext.InvocationContextParams{Agent: mockAgent})
+
+	f := &Flow{}
+
+	// First call: toolset returns nil, so f.Tools holds only the static tool.
+	// A non-nil f.Tools is what would trip a per-run cache guard.
+	req1 := &model.LLMRequest{}
+	for _, err := range toolProcessor(ctx, req1, f) {
+		if err != nil {
+			t.Fatalf("toolProcessor call 1 error: %v", err)
+		}
+	}
+	if len(f.Tools) != 1 {
+		t.Errorf("after call 1: got %d tools, want 1", len(f.Tools))
+	}
+
+	// Second call: toolset now returns extraTool — f.Tools must be updated.
+	req2 := &model.LLMRequest{}
+	for _, err := range toolProcessor(ctx, req2, f) {
+		if err != nil {
+			t.Fatalf("toolProcessor call 2 error: %v", err)
+		}
+	}
+	if len(f.Tools) != 2 || f.Tools[1].Name() != extraTool.Name() {
+		t.Errorf("after call 2: got tools %v, want [%s %s]", f.Tools, baseTool.Name(), extraTool.Name())
+	}
+
+	if ts.callCount != 2 {
+		t.Errorf("toolset.Tools() called %d times, want 2", ts.callCount)
+	}
+}
+
+func TestCallLLMSkipsNilResponseAndContinues(t *testing.T) {
+	tests := []struct {
+		name          string
+		responses     []*model.LLMResponse
+		wantResponses int
+	}{
+		{
+			name:          "nil only",
+			responses:     []*model.LLMResponse{nil},
+			wantResponses: 0,
+		},
+		{
+			name: "nil then final",
+			responses: []*model.LLMResponse{
+				nil,
+				{Content: &genai.Content{Role: "model", Parts: []*genai.Part{{Text: "done"}}}},
+			},
+			wantResponses: 1,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			m := &mockModelForTest{
+				name: "test-model",
+				generateContent: func(context.Context, *model.LLMRequest, bool) iter.Seq2[*model.LLMResponse, error] {
+					return func(yield func(*model.LLMResponse, error) bool) {
+						for _, resp := range tc.responses {
+							if !yield(resp, nil) {
+								return
+							}
+						}
+					}
+				},
+			}
+			f := &Flow{Model: m}
+			ctx := icontext.NewInvocationContext(t.Context(), icontext.InvocationContextParams{})
+
+			gotResponses := 0
+			for _, err := range f.callLLM(ctx, &model.LLMRequest{}, map[string]any{}, map[string]int64{}) {
+				if err != nil {
+					t.Fatalf("callLLM() returned unexpected error: %v", err)
+				}
+				gotResponses++
+			}
+			if gotResponses != tc.wantResponses {
+				t.Fatalf("callLLM() yielded %d responses, want %d", gotResponses, tc.wantResponses)
+			}
+		})
+	}
 }

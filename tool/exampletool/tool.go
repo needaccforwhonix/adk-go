@@ -17,6 +17,8 @@ package exampletool
 
 import (
 	"fmt"
+	"maps"
+	"slices"
 	"strings"
 
 	"google.golang.org/genai"
@@ -60,8 +62,12 @@ func (s exampleTool) Description() string {
 
 // ProcessRequest adds the exampleTool examples to the LLM request.
 func (s exampleTool) ProcessRequest(ctx agent.Context, req *model.LLMRequest) error {
-	parts := ctx.UserContent().Parts
-	if len(parts) == 0 || parts[0].Text == "" {
+	userContent := ctx.UserContent()
+	if userContent == nil {
+		return nil
+	}
+	parts := userContent.Parts
+	if len(parts) == 0 || parts[0] == nil || parts[0].Text == "" {
 		return nil
 	}
 
@@ -93,6 +99,10 @@ const (
 func buildExamplesSystemInstruction(examples []*Example, model string) string {
 	var sb strings.Builder
 	sb.WriteString(examplesIntro)
+	// As in adk-python's convert_examples_to_text, Gemini models, and a request
+	// that names no model, take plain fences; the tool_code and tool_outputs
+	// fences are for other models.
+	isGemini := model == "" || strings.Contains(model, "gemini-")
 	for exampleNum, example := range examples {
 		fmt.Fprintf(&sb, exampleStart, exampleNum+1)
 		sb.WriteString(userPrefix)
@@ -105,7 +115,6 @@ func buildExamplesSystemInstruction(examples []*Example, model string) string {
 				}
 			}
 		}
-		gemini2 := strings.Contains(model, "gemini-2")
 		previousRole := ""
 		for _, content := range example.Output {
 			var role string
@@ -121,22 +130,25 @@ func buildExamplesSystemInstruction(examples []*Example, model string) string {
 			for _, part := range content.Parts {
 				if part.FunctionCall != nil {
 					args := []string{}
-					for k, v := range part.FunctionCall.Args {
+					// Sorted, because map order would make the instruction differ
+					// from one request to the next.
+					for _, k := range slices.Sorted(maps.Keys(part.FunctionCall.Args)) {
+						v := part.FunctionCall.Args[k]
 						if _, ok := v.(string); ok {
 							args = append(args, fmt.Sprintf("%s='%s'", k, v))
 						} else {
 							args = append(args, fmt.Sprintf("%s=%v", k, v))
 						}
 					}
-					prefix := functionPrefix
-					if gemini2 {
-						prefix = functionCallPrefix
+					prefix := functionCallPrefix
+					if isGemini {
+						prefix = functionPrefix
 					}
 					fmt.Fprintf(&sb, "%s%s(%s)%s", prefix, part.FunctionCall.Name, strings.Join(args, ", "), functionCallSuffix)
 				} else if part.FunctionResponse != nil {
-					prefix := functionPrefix
-					if gemini2 {
-						prefix = functionResponsePrefix
+					prefix := functionResponsePrefix
+					if isGemini {
+						prefix = functionPrefix
 					}
 					fmt.Fprintf(&sb, "%s%v%s", prefix, part.FunctionResponse, functionResponseSuffix)
 				} else if part.Text != "" {

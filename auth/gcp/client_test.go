@@ -48,6 +48,7 @@ func TestRetrieveCredential(t *testing.T) {
 		bodies      []string
 		wantCalls   int       // >0 => assert the number of service calls
 		wantBearer  string    // expect a bearer credential carrying this token
+		wantExpiry  string    // non-empty => expect this timestamp as ExpiresAt
 		wantAPIKey  [2]string // expect an API-key credential {name, value}
 		wantConsent [2]string // expect *auth.ConsentRequiredError {authURI, nonce}
 		wantErrIs   error     // expect errors.Is(err, target)
@@ -59,6 +60,21 @@ func TestRetrieveCredential(t *testing.T) {
 			name:       "agent identity bearer",
 			resource:   authProviderResource,
 			bodies:     []string{`{"success":{"token":"tok","header":"Authorization: Bearer"}}`},
+			wantBearer: "tok",
+		},
+		{
+			name:       "agent identity bearer with expiry",
+			resource:   authProviderResource,
+			bodies:     []string{`{"success":{"token":"tok","header":"Authorization: Bearer","expireTime":"2999-01-01T00:00:00Z"}}`},
+			wantBearer: "tok",
+			wantExpiry: "2999-01-01T00:00:00Z",
+		},
+		{
+			// An unparseable expiry leaves ExpiresAt zero, which the provider
+			// reads as "don't cache"; the credential itself is still usable.
+			name:       "agent identity bearer with unparseable expiry",
+			resource:   authProviderResource,
+			bodies:     []string{`{"success":{"token":"tok","header":"Authorization: Bearer","expireTime":"not-a-time"}}`},
 			wantBearer: "tok",
 		},
 		{
@@ -94,6 +110,27 @@ func TestRetrieveCredential(t *testing.T) {
 			wantBearer: "tok",
 		},
 		{
+			// The connector's expireTime shape is an assumption — the service
+			// publishes no discovery document — so a value of another JSON type must
+			// cost the cache entry, not the credential. Decoding it strictly would
+			// fail the whole retrieval and take auth down with it.
+			name:       "connector expireTime of an unexpected JSON type",
+			resource:   connectorResource,
+			bodies:     []string{`{"done":true,"response":{"token":"tok","header":"Authorization: Bearer","expireTime":{"seconds":1798761600}}}`},
+			wantBearer: "tok",
+		},
+		{
+			// The connector reads its expiry from the operation's response, a
+			// different path from Agent Identity's. Without this case, dropping the
+			// expiry there leaves the suite green and a connector-backed provider
+			// silently never caches.
+			name:       "connector bearer with expiry",
+			resource:   connectorResource,
+			bodies:     []string{`{"done":true,"response":{"token":"tok","header":"Authorization: Bearer","expireTime":"2999-01-01T00:00:00Z"}}`},
+			wantBearer: "tok",
+			wantExpiry: "2999-01-01T00:00:00Z",
+		},
+		{
 			name:       "connector polls consent pending then succeeds",
 			resource:   connectorResource,
 			bodies:     []string{`{"metadata":{"@type":"x","consentPending":{}}}`, `{"done":true,"response":{"token":"tok","header":"Authorization: Bearer"}}`},
@@ -126,7 +163,7 @@ func TestRetrieveCredential(t *testing.T) {
 			bodies:      []string{`{"done":true}`},
 			wantErrText: "no credential",
 		},
-		// The two services deliberately disagree on an unrecognised 200: Agent
+		// The two services deliberately disagree on an unrecognized 200: Agent
 		// Identity's result is a closed oneof, so an unknown arm can only be a
 		// mismatch worth failing on...
 		{
@@ -137,7 +174,7 @@ func TestRetrieveCredential(t *testing.T) {
 			wantCalls:   1,
 		},
 		// ...whereas a connector operation that is merely not done yet is normal,
-		// so an unrecognised one keeps being polled until the timeout.
+		// so an unrecognized one keeps being polled until the timeout.
 		{
 			name:        "connector unrecognized operation polls to timeout",
 			resource:    connectorResource,
@@ -155,7 +192,7 @@ func TestRetrieveCredential(t *testing.T) {
 			if tc.pollTimeout > 0 {
 				c.pollTimeout = tc.pollTimeout
 			}
-			cred, err := c.RetrieveCredential(t.Context(),
+			got, err := c.RetrieveCredential(t.Context(),
 				Request{Resource: tc.resource, UserID: "u"})
 
 			switch {
@@ -163,12 +200,25 @@ func TestRetrieveCredential(t *testing.T) {
 				if err != nil {
 					t.Fatalf("RetrieveCredential() error = %v", err)
 				}
-				wantBearer(t, cred, tc.wantBearer)
+				wantBearer(t, got.Credential, tc.wantBearer)
+				if tc.wantExpiry != "" {
+					want, err := time.Parse(time.RFC3339, tc.wantExpiry)
+					if err != nil {
+						// Otherwise a mistyped want parses to the zero time, which is exactly
+						// what a dropped expiry produces, and the case asserts its own inverse.
+						t.Fatalf("parse wantExpiry %q: %v", tc.wantExpiry, err)
+					}
+					if !got.ExpiresAt.Equal(want) {
+						t.Errorf("ExpiresAt = %v, want %v", got.ExpiresAt, want)
+					}
+				} else if !got.ExpiresAt.IsZero() {
+					t.Errorf("ExpiresAt = %v, want zero", got.ExpiresAt)
+				}
 			case tc.wantAPIKey[0] != "":
 				if err != nil {
 					t.Fatalf("RetrieveCredential() error = %v", err)
 				}
-				wantAPIKey(t, cred, tc.wantAPIKey[0], tc.wantAPIKey[1])
+				wantAPIKey(t, got.Credential, tc.wantAPIKey[0], tc.wantAPIKey[1])
 			case tc.wantConsent[0] != "":
 				var consent *auth.ConsentRequiredError
 				if !errors.As(err, &consent) {
@@ -652,11 +702,11 @@ func TestNewClientOutlivesConstructionCtx(t *testing.T) {
 	}
 	cancel()
 
-	cred, err := c.RetrieveCredential(t.Context(), Request{Resource: authProviderResource, UserID: "u"})
+	got, err := c.RetrieveCredential(t.Context(), Request{Resource: authProviderResource, UserID: "u"})
 	if err != nil {
 		t.Fatalf("RetrieveCredential() error = %v", err)
 	}
-	wantBearer(t, cred, "tok")
+	wantBearer(t, got.Credential, "tok")
 }
 
 // fakeADC points Application Default Credentials at a local token server so the
@@ -892,6 +942,11 @@ func TestServiceErrorsRedactTheActingUser(t *testing.T) {
 	// Where one contains the other they are redacted as one range, which is
 	// TestRedactAcrossSeveralSecrets' subject rather than this test's.
 	const uri = "https://app.test/cb?state=opaque"
+	// Bearer material the Agent Identity route sends as forceRefreshToken.
+	// Deliberately not shaped like a real access token, which the repository's
+	// secret scan rejects even in a fixture. The "/" makes it an unusable header
+	// name, so mapCredential's arm is reachable.
+	const prior = "prior-token/not-a-real-one"
 
 	for _, tc := range []struct {
 		name        string
@@ -952,6 +1007,20 @@ func TestServiceErrorsRedactTheActingUser(t *testing.T) {
 		wantAbsent:  []string{uri},
 		wantPresent: []string{"not a usable HTTP header name"},
 	}, {
+		name:        "an error body echoing the prior token",
+		resource:    authProviderResource,
+		status:      http.StatusBadRequest,
+		body:        "invalid forceRefreshToken: " + prior,
+		wantAbsent:  []string{prior},
+		wantPresent: []string{"invalid forcerefreshtoken"},
+	}, {
+		name:        "an unusable header name echoing the prior token",
+		resource:    authProviderResource,
+		status:      http.StatusOK,
+		body:        `{"success":{"header":"X-` + prior + `","token":"t"}}`,
+		wantAbsent:  []string{prior},
+		wantPresent: []string{"not a usable HTTP header name"},
+	}, {
 		// The negative control. An error carrying neither identifier has to come
 		// back whole, or the rows above are satisfied by dropping all service
 		// text rather than by scrubbing it.
@@ -969,7 +1038,7 @@ func TestServiceErrorsRedactTheActingUser(t *testing.T) {
 			defer srv.Close()
 
 			_, err := newTestClient(t, srv).RetrieveCredential(t.Context(), Request{
-				Resource: tc.resource, UserID: user, ContinueURI: uri,
+				Resource: tc.resource, UserID: user, ContinueURI: uri, PriorToken: prior,
 			})
 			if err == nil {
 				t.Fatal("RetrieveCredential() = nil error, want the service's error")

@@ -60,18 +60,18 @@ func ContentsRequestProcessor(ctx agent.InvocationContext, req *model.LLMRequest
 		// adk-python, where _llm_agent_wrapper.py gates the same override on
 		// include_contents being absent from model_fields_set.
 		//
-		// How to shape the turn also honours the declaration, since the
+		// How to shape the turn also honors the declaration, since the
 		// single-turn nudge describes the agent rather than its placement.
 		boundMode, bound := BoundMode(ctx, name, state)
 		// Only "default" opts out of the placement. Testing for "" instead
-		// would let any unrecognised value opt out too, and IncludeContents is
-		// an unvalidated string, so a typo — "None", "defualt" — would hand a
+		// would let any unrecognized value opt out too, and IncludeContents is
+		// an unvalidated string, so a typo — "None", "defualt" //nolint:misspell — would hand a
 		// one-shot node the whole transcript. The merge base forced "none" here
 		// and so could not be misconfigured this way.
 		placementHidesHistory := bound && boundMode == ModeSingleTurn &&
-			state.IncludeContents != includeContentsDefault
+			state.IncludeContents != IncludeContentsDefault
 		fn := buildContentsDefault // anything but "none", unless the placement hides it.
-		if state.IncludeContents == includeContentsNone || placementHidesHistory {
+		if state.IncludeContents == IncludeContentsNone || placementHidesHistory {
 			fn = buildContentsCurrentTurnContextOnly
 		}
 		isSingleTurn := ModeFor(ctx, name, state) == ModeSingleTurn
@@ -79,10 +79,10 @@ func ContentsRequestProcessor(ctx agent.InvocationContext, req *model.LLMRequest
 		// A compaction record instructs prompt assembly to drop a span of
 		// history and substitute content in its place. EventActions is
 		// writable by tool code, and the REST create-session body maps it
-		// verbatim onto the stored event, so honouring any record found in a
+		// verbatim onto the stored event, so honoring any record found in a
 		// session would be an erase-and-inject primitive that works even for an
 		// application that never enabled compaction. Records are therefore only
-		// honoured when this run actually has compaction configured.
+		// honored when this run actually has compaction configured.
 		compactionEnabled := compactionctx.FromContext(ctx).Configured()
 
 		var events []*session.Event
@@ -121,6 +121,7 @@ func buildContentsDefault(agentName, invocationBranch, isolationScope string, ev
 func buildContentsDefaultWithCallSource(agentName, invocationBranch, isolationScope string, events, allEvents []*session.Event, isSingleTurn bool, userContent *genai.Content) ([]*genai.Content, error) {
 	// parse the events, leaving the contents and the function calls and responses from the current agent.
 	var filtered []*session.Event
+	callIDs := functionCallIDs(allEvents)
 	for _, ev := range events {
 		content := utils.Content(ev)
 		// Skip events without content or generated neither by user nor
@@ -142,6 +143,9 @@ func buildContentsDefaultWithCallSource(agentName, invocationBranch, isolationSc
 		if !eventBelongsToBranch(invocationBranch, ev) {
 			continue
 		}
+		if isToolSubBranchEvent(invocationBranch, ev, agentName, callIDs) {
+			continue
+		}
 		// Skip events outside the agent's isolation scope. Unlike branch
 		// (where empty is universally visible), isolation scope is an
 		// exact match: a scoped agent sees only its own scope, an
@@ -153,7 +157,11 @@ func buildContentsDefaultWithCallSource(agentName, invocationBranch, isolationSc
 			continue
 		}
 		if isOtherAgentReply(agentName, ev) && !compactioninternal.HasUsableSummary(ev) {
-			filtered = append(filtered, ConvertForeignEvent(ev))
+			// ConvertForeignEvent returns nil to signal the foreign event
+			// should be dropped (e.g. a thought-only turn).
+			if converted := ConvertForeignEvent(ev); converted != nil {
+				filtered = append(filtered, converted)
+			}
 		} else {
 			filtered = append(filtered, ev)
 		}
@@ -214,11 +222,11 @@ func buildContentsDefaultWithCallSource(agentName, invocationBranch, isolationSc
 	}
 	filtered = processedEvents
 
-	filtered = dropOrphanedFunctionResponses(filtered, allEvents)
+	filtered, orphanRemnants := dropOrphanedFunctionResponses(filtered, allEvents)
 
 	//  src/google/adk/flows/llm_flows/contents.py
 	// 	 - _rearrange_events_for_async_function_response
-	filtered, err := rearrangeEventsForLatestFunctionResponse(filtered)
+	filtered, err := rearrangeEventsForLatestFunctionResponse(filtered, orphanRemnants)
 	if err != nil {
 		return nil, err
 	}
@@ -227,6 +235,11 @@ func buildContentsDefaultWithCallSource(agentName, invocationBranch, isolationSc
 	if err != nil {
 		return nil, err
 	}
+	// Runs after both rearrangements: dropping a trailing unanswered call
+	// first would leave a function response as the last event and let
+	// rearrangeEventsForLatestFunctionResponse discard the turns between it
+	// and its call.
+	filtered = dropOrphanedFunctionCalls(filtered)
 
 	var contents []*genai.Content
 	for _, ev := range filtered {
@@ -266,7 +279,9 @@ func eventBelongsToBranch(invocationBranch string, event *session.Event) bool {
 	return utils.EventBelongsToBranch(invocationBranch, event.Branch)
 }
 
-func dropOrphanedFunctionResponses(events, allEvents []*session.Event) []*session.Event {
+// dropOrphanedFunctionResponses also identifies surviving events whose orphaned
+// responses were removed, so later rearrangement preserves their remaining content.
+func dropOrphanedFunctionResponses(events, allEvents []*session.Event) ([]*session.Event, map[*session.Event]bool) {
 	callIDs := make(map[string]struct{})
 	for _, event := range allEvents {
 		for _, call := range utils.FunctionCalls(utils.Content(event)) {
@@ -286,6 +301,7 @@ func dropOrphanedFunctionResponses(events, allEvents []*session.Event) []*sessio
 
 	var orphanedIDs []string
 	result := make([]*session.Event, 0, len(events))
+	orphanRemnants := make(map[*session.Event]bool)
 	for _, event := range events {
 		content := utils.Content(event)
 		if content == nil {
@@ -315,22 +331,85 @@ func dropOrphanedFunctionResponses(events, allEvents []*session.Event) []*sessio
 		cloned.LLMResponse.Content.Parts = parts
 		if len(cloned.LLMResponse.Content.Parts) > 0 {
 			result = append(result, cloned)
+			orphanRemnants[cloned] = true
 		}
 	}
 
 	if len(orphanedIDs) > 0 {
-		log.Printf("adk: dropping function responses with no matching function call: %q", orphanedIDs)
+		log.Printf("adk: dropping function responses with no matching function call: %q", orphanedIDs) //nolint:forbidigo // pre-slog call site
+	}
+	return result, orphanRemnants
+}
+
+// dropOrphanedFunctionCalls removes function calls that no function response
+// in events answers, such as a call left behind by a turn interrupted before
+// its tool ran. Providers that require every call to be answered reject such
+// a history, and it would otherwise be replayed on every later turn.
+//
+// A call without an ID is kept, because there is no ID to match a response
+// against, so a missing response proves nothing. A call listed in an event's
+// LongRunningToolIDs is kept, because it is legitimately awaiting a response.
+//
+// Events carrying a dropped call are cloned, so the session history is not
+// modified, and an event left with no parts is removed.
+func dropOrphanedFunctionCalls(events []*session.Event) []*session.Event {
+	answered := make(map[string]struct{})
+	for _, event := range events {
+		for _, response := range utils.FunctionResponses(utils.Content(event)) {
+			if response.ID != "" {
+				answered[response.ID] = struct{}{}
+			}
+		}
+		for _, id := range event.LongRunningToolIDs {
+			answered[id] = struct{}{}
+		}
+	}
+
+	isOrphan := func(part *genai.Part) bool {
+		if part == nil || part.FunctionCall == nil || part.FunctionCall.ID == "" {
+			return false
+		}
+		_, found := answered[part.FunctionCall.ID]
+		return !found
+	}
+
+	var orphanedIDs []string
+	result := make([]*session.Event, 0, len(events))
+	for _, event := range events {
+		content := utils.Content(event)
+		if content == nil || !slices.ContainsFunc(content.Parts, isOrphan) {
+			result = append(result, event)
+			continue
+		}
+
+		// The whole part goes, thought signature included, as in adk-python.
+		cloned := cloneEvent(event)
+		parts := cloned.LLMResponse.Content.Parts[:0]
+		for _, part := range content.Parts {
+			if isOrphan(part) {
+				orphanedIDs = append(orphanedIDs, part.FunctionCall.ID)
+				continue
+			}
+			parts = append(parts, part)
+		}
+		cloned.LLMResponse.Content.Parts = parts
+		if len(parts) > 0 {
+			result = append(result, cloned)
+		}
+	}
+
+	if len(orphanedIDs) > 0 {
+		log.Printf("adk: dropping function calls with no matching function response: %q", orphanedIDs) //nolint:forbidigo // pre-slog call site
 	}
 	return result
 }
 
-// rearrangeEventsForLatestFunctionResponse
-// This function only acts if the very last event is a function response.
-// It searches backward for the matching call, deletes all intervening events,
-// and appends a single (merged) response.
-// If the latest function_response is for an async function_call, all events
-// between the initial function_call and the latest function_response will be removed.
-func rearrangeEventsForLatestFunctionResponse(events []*session.Event) ([]*session.Event, error) {
+// rearrangeEventsForLatestFunctionResponse merges responses to the latest event's
+// matching call while preserving unrelated tool events and orphanRemnants.
+// Retaining orphanRemnants is an exception for content left by orphan pruning;
+// other intervening non-tool events, including ordinary user and model text,
+// are still dropped.
+func rearrangeEventsForLatestFunctionResponse(events []*session.Event, orphanRemnants map[*session.Event]bool) ([]*session.Event, error) {
 	if len(events) < 2 {
 		return events, nil
 	}
@@ -424,6 +503,11 @@ SearchLoop: // A label to allow breaking out of the nested loop
 
 		responses := utils.FunctionResponses(event.Content)
 		if len(responses) == 0 {
+			// Unlike Python's blanket intermediate-event removal, retain content
+			// deliberately preserved when pruning unrelated orphaned responses.
+			if orphanRemnants[event] {
+				resultEvents = append(resultEvents, event)
+			}
 			continue
 		}
 
@@ -675,9 +759,31 @@ func mergeFunctionResponseEvents(functionResponseEvents []*session.Event) (*sess
 //	In multi-agent scenarios, the "current turn" for an agent starts from an
 //	actual user or from another agent.
 func buildContentsCurrentTurnContextOnly(agentName, branch, isolationScope string, events []*session.Event, isSingleTurn bool, userContent *genai.Content) ([]*genai.Content, error) {
-	// Find the latest event that starts the current turn and process from there
+	// The IDs of every call in the session, an empty one included. Full-history
+	// mode pairs a result and a call that both lack an ID, so none mode tracks
+	// them too; skipping them, as adk-python does, would leave such a result
+	// with no call once a user turn sits between them.
+	callIDs := make(map[string]struct{})
+	for _, event := range events {
+		for _, call := range utils.FunctionCalls(utils.Content(event)) {
+			callIDs[call.ID] = struct{}{}
+		}
+	}
+	// Find the latest event that starts the current turn and process from there.
+	// A tool result the caller posted back (a long-running tool's, say) is not
+	// a turn start, and the turn has to reach back to the call it answers, past
+	// any user turn sent while the tool was pending. This follows adk-python's
+	// _get_current_turn_contents, in a different order: adk-python records a
+	// posted-back result before its _should_include_event_in_context check and,
+	// for single-turn agents, collects call IDs from branch-filtered events.
+	// Here a result counts only once it passes the branch and isolation-scope
+	// checks below, and call IDs come from every event.
+	unanswered := make(map[string]struct{})
 	for i := len(events) - 1; i >= 0; i-- {
 		event := events[i]
+		for _, call := range utils.FunctionCalls(utils.Content(event)) {
+			delete(unanswered, call.ID)
+		}
 		// Events from a sibling branch are not part of this agent's
 		// current turn. In parallel delegations, a sibling may append its
 		// response after this agent's user input; treating that response as
@@ -685,10 +791,32 @@ func buildContentsCurrentTurnContextOnly(agentName, branch, isolationScope strin
 		if !eventBelongsToBranch(branch, event) {
 			continue
 		}
+		// A tool's sub-branch event is skipped in the contents, so it
+		// cannot start the turn either: it would cut off the call and
+		// the response that came before it.
+		if isToolSubBranchEvent(branch, event, agentName, callIDs) {
+			continue
+		}
 		// An out-of-scope event cannot start this agent's turn: it is
 		// invisible to the agent, so skip it as a pivot (matching
 		// adk-python's _should_include_event_in_context gate here).
 		if event.IsolationScope != isolationScope {
+			continue
+		}
+		if isSubmittedToolResult(event) {
+			for _, response := range utils.FunctionResponses(utils.Content(event)) {
+				if _, ok := callIDs[response.ID]; ok {
+					unanswered[response.ID] = struct{}{}
+				}
+			}
+			continue
+		}
+		if len(unanswered) > 0 {
+			continue
+		}
+		// An event discarded by foreign conversion cannot start a visible
+		// turn: keep searching so it does not slice out the preceding input.
+		if isOtherAgentReply(agentName, event) && !compactioninternal.HasUsableSummary(event) && ConvertForeignEvent(event) == nil {
 			continue
 		}
 		if event.Author == "user" || isOtherAgentReply(agentName, event) {
@@ -700,15 +828,23 @@ func buildContentsCurrentTurnContextOnly(agentName, branch, isolationScope strin
 	return buildContentsDefault(agentName, branch, isolationScope, events, isSingleTurn, userContent)
 }
 
+// isSubmittedToolResult reports whether ev is a tool result the caller posted
+// back as a user-authored function response.
+func isSubmittedToolResult(ev *session.Event) bool {
+	return ev.Author == "user" && len(utils.FunctionResponses(utils.Content(ev))) > 0
+}
+
 func isOtherAgentReply(currentAgentName string, ev *session.Event) bool {
 	return ev.Author != currentAgentName && ev.Author != "user"
 }
 
 // ConvertForeignEvent converts an event authored by another agent as
 // a user-content event.
-// This is to provide another aget's output as context to the current agent,
+// This is to provide another agent's output as context to the current agent,
 // so that the current agent can continue to respond, such as summarizing
 // the previous agent's reply, etc.
+// Thought parts and standalone metadata are omitted. A non-empty event with no
+// remaining payload returns nil.
 func ConvertForeignEvent(ev *session.Event) *session.Event {
 	content := utils.Content(ev)
 	if content == nil || len(content.Parts) == 0 {
@@ -720,6 +856,12 @@ func ConvertForeignEvent(ev *session.Event) *session.Event {
 		Parts: []*genai.Part{{Text: "For context:"}},
 	}
 	for _, p := range content.Parts {
+		// Never replay another agent's private reasoning into the current
+		// agent's context. Matches adk-python's _present_other_agent_message,
+		// which drops thought parts as the first step of its per-part loop.
+		if p.Thought {
+			continue
+		}
 		switch {
 		case p.Text != "":
 			converted.Parts = append(converted.Parts, &genai.Part{
@@ -733,9 +875,19 @@ func ConvertForeignEvent(ev *session.Event) *session.Event {
 			converted.Parts = append(converted.Parts, &genai.Part{
 				Text: fmt.Sprintf("[%s] `%s` tool returned result: %v", ev.Author, p.FunctionResponse.Name, stringify(p.FunctionResponse.Response)),
 			})
-		default: // fallback to the original part for non-text and non-functionCall parts.
+		case p.InlineData != nil || p.FileData != nil || p.ExecutableCode != nil || p.CodeExecutionResult != nil ||
+			p.ToolCall != nil || p.ToolResponse != nil || p.AudioTranscription != nil:
+			// Keep Go's server-tool and transcript parts alongside Python's
+			// media/code payloads. Standalone metadata has no relay payload.
 			converted.Parts = append(converted.Parts, p)
 		}
+	}
+
+	// If only the "For context:" header remains (e.g. a thought-only foreign
+	// turn), drop the event entirely rather than emitting a bare header, as
+	// adk-python's _present_other_agent_message returns None in this case.
+	if len(converted.Parts) == 1 {
+		return nil
 	}
 
 	return &session.Event{ // made-up event. Don't go through types.NewEvent.

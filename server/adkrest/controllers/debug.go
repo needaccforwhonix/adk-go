@@ -67,7 +67,7 @@ func (c *DebugAPIController) EventSpanHandler(rw http.ResponseWriter, req *http.
 	// Return only generate content and execute tool spans.
 	wantedOperations := []string{"execute_tool", "generate_content"}
 	for _, span := range spans {
-		opName := span.Attributes[key]
+		opName, _ := span.Attributes[key].(string)
 		if slices.Contains(wantedOperations, opName) {
 			response := convertEventSpan(span)
 			// Return the first span that matches the wanted operations - single event should contain only a single generate content or execute tool span.
@@ -185,6 +185,13 @@ func (c *DebugAPIController) EventGraphHandler(rw http.ResponseWriter, req *http
 	agent, err := c.agentloader.LoadAgent(sessionID.AppName)
 	if err != nil {
 		http.Error(rw, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	// A Loader may return a nil agent with a nil error. The generator would
+	// answer 200 with an empty digraph, which reads as "this agent has no
+	// structure" rather than "no such agent".
+	if agent == nil {
+		http.Error(rw, "agent "+sessionID.AppName+" not found", http.StatusNotFound)
 		return
 	}
 	graph, err := services.GetAgentGraph(req.Context(), agent, highlightedPairs)

@@ -16,9 +16,14 @@ package llminternal_test
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
 	"iter"
+	"runtime"
+	"strings"
 	"testing"
 
+	"github.com/google/go-cmp/cmp"
 	"google.golang.org/genai"
 
 	"google.golang.org/adk/v2/agent"
@@ -358,6 +363,114 @@ func TestProgressiveSSEPreservesThoughtSignature(t *testing.T) {
 	}
 	if string(fcPart.ThoughtSignature) != string(testThoughtSignature) {
 		t.Errorf("expected thought signature %s, got %s", string(testThoughtSignature), string(fcPart.ThoughtSignature))
+	}
+}
+
+// TestTextThoughtSignatureSurvivesMerge checks that a thought signature
+// streamed on a text chunk stays on the part the chunks are merged into, as
+// adk-python's StreamingResponseAggregator keeps it.
+func TestTextThoughtSignatureSurvivesMerge(t *testing.T) {
+	textChunk := func(text string, thought bool, signature string, finishReason genai.FinishReason) *genai.GenerateContentResponse {
+		part := &genai.Part{Text: text, Thought: thought}
+		if signature != "" {
+			part.ThoughtSignature = []byte(signature)
+		}
+		return &genai.GenerateContentResponse{
+			Candidates: []*genai.Candidate{{
+				Content:      &genai.Content{Role: "model", Parts: []*genai.Part{part}},
+				FinishReason: finishReason,
+			}},
+		}
+	}
+	callChunk := &genai.GenerateContentResponse{
+		Candidates: []*genai.Candidate{{
+			Content: &genai.Content{Role: "model", Parts: []*genai.Part{
+				{FunctionCall: &genai.FunctionCall{Name: "lookup", Args: map[string]any{"q": "dog"}}},
+			}},
+			FinishReason: genai.FinishReasonStop,
+		}},
+	}
+	tests := []struct {
+		name   string
+		chunks []*genai.GenerateContentResponse
+		want   []*genai.Part
+	}{
+		{
+			name: "signature_on_first_chunk",
+			chunks: []*genai.GenerateContentResponse{
+				textChunk("At minute 5 ", false, "text-signature", ""),
+				textChunk("the presenter speaks.", false, "", genai.FinishReasonStop),
+			},
+			want: []*genai.Part{
+				{Text: "At minute 5 the presenter speaks.", ThoughtSignature: []byte("text-signature")},
+			},
+		},
+		{
+			name: "signature_on_later_chunk",
+			chunks: []*genai.GenerateContentResponse{
+				textChunk("At minute 5 ", false, "", ""),
+				textChunk("the presenter speaks.", false, "late-signature", genai.FinishReasonStop),
+			},
+			want: []*genai.Part{
+				{Text: "At minute 5 the presenter speaks.", ThoughtSignature: []byte("late-signature")},
+			},
+		},
+		{
+			name: "first_signature_of_a_run_wins",
+			chunks: []*genai.GenerateContentResponse{
+				textChunk("At minute 5 ", false, "first-signature", ""),
+				textChunk("the presenter speaks.", false, "second-signature", genai.FinishReasonStop),
+			},
+			want: []*genai.Part{
+				{Text: "At minute 5 the presenter speaks.", ThoughtSignature: []byte("first-signature")},
+			},
+		},
+		{
+			name: "thought_and_answer_keep_their_own_signatures",
+			chunks: []*genai.GenerateContentResponse{
+				textChunk("Let me check.", true, "thought-signature", ""),
+				textChunk("It is a dog.", false, "answer-signature", genai.FinishReasonStop),
+			},
+			want: []*genai.Part{
+				{Text: "Let me check.", Thought: true, ThoughtSignature: []byte("thought-signature")},
+				{Text: "It is a dog.", ThoughtSignature: []byte("answer-signature")},
+			},
+		},
+		{
+			// The function call still gets the signature too, as it did before
+			// the text part kept it.
+			name: "signed_text_then_unsigned_call",
+			chunks: []*genai.GenerateContentResponse{
+				textChunk("Let me look.", false, "text-signature", ""),
+				callChunk,
+			},
+			want: []*genai.Part{
+				{Text: "Let me look.", ThoughtSignature: []byte("text-signature")},
+				{
+					FunctionCall:     &genai.FunctionCall{Name: "lookup", Args: map[string]any{"q": "dog"}},
+					ThoughtSignature: []byte("text-signature"),
+				},
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			aggregator := llminternal.NewStreamingResponseAggregator()
+			for _, chunk := range tt.chunks {
+				for _, err := range aggregator.ProcessResponse(t.Context(), chunk) {
+					if err != nil {
+						t.Fatalf("unexpected error processing chunk: %v", err)
+					}
+				}
+			}
+			finalResponse := aggregator.Close()
+			if finalResponse == nil {
+				t.Fatal("expected a final aggregated response, got nil")
+			}
+			if diff := cmp.Diff(tt.want, finalResponse.Content.Parts); diff != "" {
+				t.Errorf("aggregated parts mismatch (-want +got):\n%s", diff)
+			}
+		})
 	}
 }
 
@@ -1148,6 +1261,88 @@ func TestUsageMetadataRetainedWhenLaterChunkHasNoUsageMetadata(t *testing.T) {
 	}
 }
 
+// TestCloseKeepsModelVersion checks that the aggregated response reports the
+// model version of the stream's last chunk, as a non-streamed response does
+// and as adk-python's StreamingResponseAggregator.close does.
+func TestCloseKeepsModelVersion(t *testing.T) {
+	aggregator := llminternal.NewStreamingResponseAggregator()
+	ctx := t.Context()
+
+	const modelVersion = "gemini-2.5-flash-001"
+	chunks := []*genai.GenerateContentResponse{
+		{
+			Candidates: []*genai.Candidate{{Content: genai.NewContentFromText("Hello", "model")}},
+		},
+		{
+			Candidates: []*genai.Candidate{{
+				Content:      genai.NewContentFromText(" world", "model"),
+				FinishReason: genai.FinishReasonStop,
+			}},
+			ModelVersion: modelVersion,
+		},
+	}
+
+	for _, chunk := range chunks {
+		for _, err := range aggregator.ProcessResponse(ctx, chunk) {
+			if err != nil {
+				t.Fatalf("unexpected error processing chunk: %v", err)
+			}
+		}
+	}
+
+	finalResponse := aggregator.Close()
+	if finalResponse == nil {
+		t.Fatal("expected a final aggregated response, got nil")
+	}
+	if finalResponse.ModelVersion != modelVersion {
+		t.Errorf("final response ModelVersion = %q, want %q", finalResponse.ModelVersion, modelVersion)
+	}
+}
+
+// Verify that a later chunk with non-nil UsageMetadata correctly overwrites an earlier one.
+func TestUsageMetadataUpdatedByLaterChunkWithValue(t *testing.T) {
+	aggregator := llminternal.NewStreamingResponseAggregator()
+	ctx := t.Context()
+
+	// Chunk 1: initial usage.
+	chunk1 := &genai.GenerateContentResponse{
+		Candidates: []*genai.Candidate{
+			{Content: &genai.Content{Role: "model", Parts: []*genai.Part{{Text: "Hello"}}}},
+		},
+		UsageMetadata: &genai.GenerateContentResponseUsageMetadata{TotalTokenCount: 100},
+	}
+
+	// Chunk 2: updated usage (cumulative), as typically sent by Gemini.
+	chunk2 := &genai.GenerateContentResponse{
+		Candidates: []*genai.Candidate{
+			{
+				Content:      &genai.Content{Role: "model", Parts: []*genai.Part{{Text: " world"}}},
+				FinishReason: genai.FinishReasonStop,
+			},
+		},
+		UsageMetadata: &genai.GenerateContentResponseUsageMetadata{TotalTokenCount: 200},
+	}
+
+	for _, chunk := range []*genai.GenerateContentResponse{chunk1, chunk2} {
+		for _, err := range aggregator.ProcessResponse(ctx, chunk) {
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+		}
+	}
+
+	final := aggregator.Close()
+	if final == nil {
+		t.Fatal("expected a final aggregated response, got nil")
+	}
+	if final.UsageMetadata == nil {
+		t.Fatal("UsageMetadata should not be nil")
+	}
+	if final.UsageMetadata.TotalTokenCount != 200 {
+		t.Errorf("expected TotalTokenCount=200 (from last chunk), got %d", final.UsageMetadata.TotalTokenCount)
+	}
+}
+
 func TestFinishReasonUnexpectedToolCallPreservesErrorCode(t *testing.T) {
 	aggregator := llminternal.NewStreamingResponseAggregator()
 	ctx := t.Context()
@@ -1186,5 +1381,250 @@ func TestFinishReasonUnexpectedToolCallPreservesErrorCode(t *testing.T) {
 
 	if finalResponse.ErrorMessage != "" {
 		t.Errorf("ErrorMessage was unexpectedly overwritten to '%s'", finalResponse.ErrorMessage)
+	}
+}
+
+// streamFunctionCall runs one streamed function call the way Vertex sends it:
+// a first chunk that only names the call, then nameless chunks of partial
+// arguments, then the chunk that ends it. It returns the assembled arguments
+// as JSON, which is the form the tool's schema is validated against.
+func streamFunctionCall(t *testing.T, name string, chunks ...[]*genai.PartialArg) string {
+	t.Helper()
+
+	calls := []*genai.FunctionCall{{Name: name, ID: "fc_" + name, WillContinue: ptr(true)}}
+	for _, partialArgs := range chunks {
+		calls = append(calls, &genai.FunctionCall{PartialArgs: partialArgs, WillContinue: ptr(true)})
+	}
+	calls = append(calls, &genai.FunctionCall{WillContinue: ptr(false)})
+
+	aggregator := llminternal.NewStreamingResponseAggregator()
+	for i, call := range calls {
+		chunk := &genai.GenerateContentResponse{
+			Candidates: []*genai.Candidate{{
+				Content: &genai.Content{Role: "model", Parts: []*genai.Part{{FunctionCall: call}}},
+			}},
+		}
+		if i == len(calls)-1 {
+			chunk.Candidates[0].FinishReason = genai.FinishReasonStop
+		}
+		for _, err := range aggregator.ProcessResponse(t.Context(), chunk) {
+			if err != nil {
+				t.Fatalf("chunk %d: unexpected error: %v", i, err)
+			}
+		}
+	}
+
+	finalResponse := aggregator.Close()
+	if finalResponse == nil {
+		t.Fatal("expected final response from aggregator")
+	}
+	parts := finalResponse.Content.Parts
+	if len(parts) != 1 || parts[0].FunctionCall == nil {
+		t.Fatalf("expected exactly one function call part, got %+v", parts)
+	}
+	args, err := json.Marshal(parts[0].FunctionCall.Args)
+	if err != nil {
+		t.Fatalf("assembled arguments do not marshal: %v", err)
+	}
+	return string(args)
+}
+
+// An argument that is an array of objects is the common case for a chart: the
+// model streams one member of one element at a time, and a string member can
+// be split over several chunks and closed by a chunk that carries the path and
+// no value at all.
+func TestStreamedArrayOfObjectsArgument(t *testing.T) {
+	args := streamFunctionCall(t, "render_chart",
+		[]*genai.PartialArg{{JsonPath: "$.data[0].label", StringValue: "Jan 20", WillContinue: ptr(true)}},
+		[]*genai.PartialArg{{JsonPath: "$.data[0].label", StringValue: "23", WillContinue: ptr(true)}},
+		[]*genai.PartialArg{{JsonPath: "$.data[0].label"}},
+		[]*genai.PartialArg{{JsonPath: "$.data[0].value", NumberValue: ptr(1250.5)}},
+		[]*genai.PartialArg{{JsonPath: "$.data[1].label", StringValue: "Feb 2023"}},
+		[]*genai.PartialArg{{JsonPath: "$.data[1].value", NumberValue: ptr(990.0)}},
+		[]*genai.PartialArg{{JsonPath: "$.title", StringValue: "Revenue"}},
+	)
+
+	want := `{"data":[{"label":"Jan 2023","value":1250.5},{"label":"Feb 2023","value":990}],"title":"Revenue"}`
+	if args != want {
+		t.Errorf("assembled arguments\n got %s\nwant %s", args, want)
+	}
+}
+
+// A top-level array of strings has no member name to hide the index behind, so
+// it is the shape that exposes a path split on "." alone.
+func TestStreamedArrayOfStringsArgument(t *testing.T) {
+	args := streamFunctionCall(t, "describe_tables",
+		[]*genai.PartialArg{{JsonPath: "$.tables[0]", StringValue: "ord", WillContinue: ptr(true)}},
+		[]*genai.PartialArg{{JsonPath: "$.tables[0]", StringValue: "ers"}},
+		[]*genai.PartialArg{{JsonPath: "$.tables[1]", StringValue: "customers"}},
+	)
+
+	want := `{"tables":["orders","customers"]}`
+	if args != want {
+		t.Errorf("assembled arguments\n got %s\nwant %s", args, want)
+	}
+}
+
+// Indices are positions, not arrival order: an element that arrives late keeps
+// the index the model gave it, and the gap it leaves stays null.
+func TestStreamedArrayArgumentKeepsIndexPositions(t *testing.T) {
+	args := streamFunctionCall(t, "query_gold_table",
+		[]*genai.PartialArg{{JsonPath: "$.queries[2]", StringValue: "third"}},
+		[]*genai.PartialArg{{JsonPath: "$.queries[0]", StringValue: "first"}},
+	)
+
+	want := `{"queries":["first",null,"third"]}`
+	if args != want {
+		t.Errorf("assembled arguments\n got %s\nwant %s", args, want)
+	}
+}
+
+// Numbers, booleans and nulls inside an array element, and a nested object,
+// all survive the same traversal.
+func TestStreamedArrayArgumentScalarTypes(t *testing.T) {
+	args := streamFunctionCall(t, "render_chart",
+		[]*genai.PartialArg{{JsonPath: "$.filters[0].enabled", BoolValue: ptr(true)}},
+		[]*genai.PartialArg{{JsonPath: "$.filters[0].value", NULLValue: "NULL_VALUE"}},
+		[]*genai.PartialArg{{JsonPath: "$.filters[1].enabled", BoolValue: ptr(false)}},
+		[]*genai.PartialArg{{JsonPath: "$.options.stacked", BoolValue: ptr(true)}},
+		[]*genai.PartialArg{{JsonPath: "$.limit", NumberValue: ptr(10.0)}},
+	)
+
+	want := `{"filters":[{"enabled":true,"value":null},{"enabled":false}],"limit":10,"options":{"stacked":true}}`
+	if args != want {
+		t.Errorf("assembled arguments\n got %s\nwant %s", args, want)
+	}
+}
+
+// RFC 9535 addresses a member whose name is not a bare identifier with a quoted
+// bracket selector, which is the only way a property name containing a dot can
+// be told apart from two nested members.
+func TestStreamedArgumentQuotedMemberNames(t *testing.T) {
+	args := streamFunctionCall(t, "render_chart",
+		[]*genai.PartialArg{{JsonPath: `$['series.name'][0]["data point"]`, StringValue: "x"}},
+		[]*genai.PartialArg{{JsonPath: `$['it\'s']`, StringValue: "y"}},
+	)
+
+	want := `{"it's":"y","series.name":[{"data point":"x"}]}`
+	if args != want {
+		t.Errorf("assembled arguments\n got %s\nwant %s", args, want)
+	}
+}
+
+// A path the parser does not understand is dropped rather than written to an
+// invented key, so one unreadable chunk cannot add a property the tool's schema
+// will reject. "$.tables[]" is not hypothetical: Vertex closes a streamed array
+// with exactly that path and no value.
+func TestStreamedArgumentUnsupportedPathsDropped(t *testing.T) {
+	args := streamFunctionCall(t, "render_chart",
+		[]*genai.PartialArg{{JsonPath: "$.data[]", StringValue: "end of array"}},
+		[]*genai.PartialArg{{JsonPath: "$.data[*]", StringValue: "wildcard"}},
+		[]*genai.PartialArg{{JsonPath: "$.data[0:2]", StringValue: "slice"}},
+		[]*genai.PartialArg{{JsonPath: "$..data", StringValue: "descendant"}},
+		[]*genai.PartialArg{{JsonPath: "$.data[-1]", StringValue: "negative"}},
+		[]*genai.PartialArg{{JsonPath: "", StringValue: "empty"}},
+		[]*genai.PartialArg{{JsonPath: "$.title", StringValue: "kept"}},
+	)
+
+	want := `{"title":"kept"}`
+	if args != want {
+		t.Errorf("assembled arguments\n got %s\nwant %s", args, want)
+	}
+}
+
+// An index too large to allocate, or too large to fit in an int, is dropped.
+// The bound that rejects it is all that keeps an overflowed, negative index
+// from reaching the slice it would be used on.
+func TestStreamedArgumentOutOfRangeIndexDropped(t *testing.T) {
+	args := streamFunctionCall(t, "render_chart",
+		[]*genai.PartialArg{{JsonPath: "$.data[65537]", StringValue: "too large"}},
+		[]*genai.PartialArg{{JsonPath: "$.data[9999999999999999999]", StringValue: "overflows int"}},
+		[]*genai.PartialArg{{JsonPath: "$.title", StringValue: "kept"}},
+	)
+
+	want := `{"title":"kept"}`
+	if args != want {
+		t.Errorf("assembled arguments\n got %s\nwant %s", args, want)
+	}
+}
+
+// TestProcessResponseNilCandidate is a regression test: a streamed chunk whose
+// first candidate is nil (degenerate chunks are reachable per converters.go)
+// must not panic when checking FinishReason.
+func TestProcessResponseNilCandidate(t *testing.T) {
+	aggregator := llminternal.NewStreamingResponseAggregator()
+	chunk := &genai.GenerateContentResponse{Candidates: []*genai.Candidate{nil}}
+	for _, err := range aggregator.ProcessResponse(t.Context(), chunk) {
+		if err != nil {
+			t.Fatalf("ProcessResponse yielded error: %v", err)
+		}
+	}
+}
+
+// streamedTextResponses returns n responses of one 200-byte text part each,
+// the shape a long streamed reply arrives in.
+func streamedTextResponses(n int) []*genai.GenerateContentResponse {
+	responses := make([]*genai.GenerateContentResponse, n)
+	for i := range responses {
+		responses[i] = &genai.GenerateContentResponse{Candidates: []*genai.Candidate{{
+			Content: genai.NewContentFromText(strings.Repeat("x", 200), genai.RoleModel),
+		}}}
+	}
+	return responses
+}
+
+func aggregateStream(ctx context.Context, responses []*genai.GenerateContentResponse) (*model.LLMResponse, error) {
+	agg := llminternal.NewStreamingResponseAggregator()
+	for _, r := range responses {
+		for _, err := range agg.ProcessResponse(ctx, r) {
+			if err != nil {
+				return nil, err
+			}
+		}
+	}
+	return agg.Close(), nil
+}
+
+func TestStreamingResponseAggregatorDoesNotRecopyText(t *testing.T) {
+	bytesAllocated := func(chunks int) uint64 {
+		responses := streamedTextResponses(chunks)
+		var least uint64
+		for range 3 {
+			var before, after runtime.MemStats
+			runtime.ReadMemStats(&before)
+			resp, err := aggregateStream(t.Context(), responses)
+			runtime.ReadMemStats(&after)
+			if err != nil {
+				t.Fatalf("aggregateStream() error = %v", err)
+			}
+			if got, want := len(resp.Content.Parts[0].Text), chunks*200; got != want {
+				t.Fatalf("aggregated %d bytes of text, want %d", got, want)
+			}
+			if n := after.TotalAlloc - before.TotalAlloc; least == 0 || n < least {
+				least = n
+			}
+		}
+		return least
+	}
+	// Appending through a builder makes the bytes allocated grow linearly with
+	// the number of chunks, so doubling the chunks about doubles them.
+	// Recopying the text on every chunk makes them grow quadratically.
+	small, large := bytesAllocated(1000), bytesAllocated(2000)
+	if ratio := float64(large) / float64(small); ratio > 3 {
+		t.Errorf("doubling the chunks multiplied the bytes allocated by %.1f (%d to %d), want about 2", ratio, small, large)
+	}
+}
+
+func BenchmarkStreamingResponseAggregator(b *testing.B) {
+	for _, chunks := range []int{15, 90, 500} {
+		responses := streamedTextResponses(chunks)
+		b.Run(fmt.Sprintf("chunks=%d", chunks), func(b *testing.B) {
+			b.ReportAllocs()
+			for b.Loop() {
+				if _, err := aggregateStream(b.Context(), responses); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
 	}
 }

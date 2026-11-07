@@ -28,14 +28,17 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/go-cmp/cmp"
 	"github.com/gorilla/websocket"
 	"google.golang.org/genai"
 
 	"google.golang.org/adk/v2/agent"
 	"google.golang.org/adk/v2/internal/agent/runconfig"
 	icontext "google.golang.org/adk/v2/internal/context"
+	"google.golang.org/adk/v2/internal/utils"
 	"google.golang.org/adk/v2/model"
 	"google.golang.org/adk/v2/session"
+	"google.golang.org/adk/v2/tool"
 )
 
 // fakeLiveModel implements model.LLM plus the Client() accessor RunLive
@@ -59,6 +62,16 @@ const serverContentPong = `{"serverContent":{"modelTurn":{"parts":[{"text":"pong
 // then hands the connection to serveConn with a 1-based connection number.
 // When serveConn returns, the connection is hard-closed (no close handshake).
 func startFakeLiveServer(t *testing.T, serveConn func(connNum int, conn *websocket.Conn)) (*genai.Client, *atomic.Int32) {
+	t.Helper()
+	client, connCount, _ := startClosableLiveServer(t, serveConn)
+	return client, connCount
+}
+
+// startClosableLiveServer is startFakeLiveServer plus a func that stops the
+// server accepting new connections, so a test can turn a working endpoint into
+// one that refuses every later dial. It closes the listener rather than the
+// server, which needs no in-flight connection to have finished first.
+func startClosableLiveServer(t *testing.T, serveConn func(connNum int, conn *websocket.Conn)) (*genai.Client, *atomic.Int32, func()) {
 	t.Helper()
 	var upgrader websocket.Upgrader
 	var connCount atomic.Int32
@@ -92,7 +105,21 @@ func startFakeLiveServer(t *testing.T, serveConn func(connNum int, conn *websock
 	if err != nil {
 		t.Fatalf("NewClient failed: %v", err)
 	}
-	return client, &connCount
+	return client, &connCount, func() { _ = ts.Listener.Close() }
+}
+
+// waitForConns blocks until the fake server has accepted at least n
+// connections, failing the test rather than hanging if it never does.
+func waitForConns(t *testing.T, connCount *atomic.Int32, n int32) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		if connCount.Load() >= n {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("server accepted %d connections, want at least %d", connCount.Load(), n)
 }
 
 // blockUntilClientCloses parks the fake connection until the client tears it
@@ -321,12 +348,45 @@ func TestRunLiveNoGoroutineLeak(t *testing.T) {
 			wantConns: 2,
 		},
 		{
+			// A close frame with code 1008 (policy violation) reaches
+			// isResumable as a *websocket.CloseError and must reconnect.
+			name: "policy violation close 1008 reconnects",
+			serveConn: func(connNum int, conn *websocket.Conn) {
+				if connNum == 1 {
+					deadline := time.Now().Add(time.Second)
+					_ = conn.WriteControl(websocket.CloseMessage,
+						websocket.FormatCloseMessage(websocket.ClosePolicyViolation, "policy violation"), deadline)
+					return
+				}
+				if err := conn.WriteMessage(websocket.TextMessage, []byte(serverContentPong)); err != nil {
+					return
+				}
+				blockUntilClientCloses(conn)
+			},
+			drive: func(t *testing.T, sess agent.LiveSession, seq iter.Seq2[*session.Event, error], cancel context.CancelFunc) {
+				sawTurn := false
+				for ev, err := range seq {
+					if err != nil {
+						continue
+					}
+					if ev != nil && ev.LLMResponse.Content != nil {
+						sawTurn = true
+						cancel()
+					}
+				}
+				if !sawTurn {
+					t.Error("never received the post-reconnect model turn")
+				}
+			},
+			wantConns: 2,
+		},
+		{
 			// A close frame with a non-resumable code must surface as an error
 			// to the caller and terminate the flow after a single connection.
 			//
 			// This case passes with or without the errChan guards: the sender
 			// exits through the existing connCtx.Done() arm, so nothing is
-			// stranded. It pins the terminal-path behaviour; it is not a
+			// stranded. It pins the terminal-path behavior; it is not a
 			// regression guard for the leak.
 			name: "non-resumable error terminates after one connection",
 			serveConn: func(connNum int, conn *websocket.Conn) {
@@ -348,7 +408,7 @@ func TestRunLiveNoGoroutineLeak(t *testing.T) {
 			wantConns: 1,
 		},
 		{
-			// Cancelling the invocation context while the reader is blocked in
+			// Canceling the invocation context while the reader is blocked in
 			// Recv is the everyday teardown path: cleanup closes the
 			// connection, the reader's Recv fails, and its error send must not
 			// block forever on the abandoned channel.
@@ -422,7 +482,7 @@ func liveHistoryProcessor(ctx agent.InvocationContext, req *model.LLMRequest, f 
 // Every other return in RunLive's own body releases the attempt through
 // cleanup (or cancelConn, before the connection exists). The SendHistory
 // failure path returns without either, so the websocket is never closed.
-// Cancelling the context would not help: genai dials with
+// Canceling the context would not help: genai dials with
 // websocket.DefaultDialer.Dial, which takes no context, and nothing in the SDK
 // watches one — only an explicit Close releases that socket. So the connection
 // survives for the lifetime of the process, not just the invocation.
@@ -545,4 +605,174 @@ func TestRunLiveCloseStopsIdleSession(t *testing.T) {
 		t.Errorf("connection count = %d, want 1 (Close must not trigger a reconnect)", got)
 	}
 	assertNoRunLiveLeak(t, baseline)
+}
+
+// TestRunLiveSkipsNilRealtimeInput checks that a nil pointer of a documented
+// RealtimeInput type sends nothing. The sender goroutine used to dereference a
+// nil *genai.Blob, and its panic ended the process.
+func TestRunLiveSkipsNilRealtimeInput(t *testing.T) {
+	tests := []struct {
+		name   string
+		inputs []any
+		want   []string
+	}{
+		{
+			name:   "nil pointers",
+			inputs: []any{(*genai.Blob)(nil), (*genai.ActivityStart)(nil), (*genai.ActivityEnd)(nil)},
+		},
+		{
+			name:   "non-nil pointers",
+			inputs: []any{&genai.Blob{Data: []byte{1, 2}, MIMEType: "audio/pcm"}, &genai.ActivityStart{}, &genai.ActivityEnd{}},
+			want: []string{
+				`{"realtimeInput":{"mediaChunks":[{"data":"AQI=","mimeType":"audio/pcm"}]}}`,
+				`{"realtimeInput":{"activityStart":{}}}`,
+				`{"realtimeInput":{"activityEnd":{}}}`,
+			},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			frames := make(chan string, len(tc.inputs)+1)
+			client, _ := startFakeLiveServer(t, func(connNum int, conn *websocket.Conn) {
+				for {
+					_, msg, err := conn.ReadMessage()
+					if err != nil {
+						return
+					}
+					frames <- string(msg)
+				}
+			})
+			f := &Flow{
+				Model:             &fakeLiveModel{client: client},
+				RequestProcessors: []func(ctx agent.InvocationContext, req *model.LLMRequest, f *Flow) iter.Seq2[*session.Event, error]{liveConfigProcessor},
+			}
+			ctx, cancel := newLiveInvocationContext(t)
+			defer cancel()
+
+			sess, seq, err := f.RunLive(ctx)
+			if err != nil {
+				t.Fatalf("RunLive failed: %v", err)
+			}
+			defer func() { _ = sess.Close() }()
+			// Drain the events. While an event waits for a reader, the flow
+			// reads no sender errors, so a failed send would hang the next
+			// Send.
+			go func() {
+				for range seq {
+				}
+			}()
+
+			for _, in := range tc.inputs {
+				if err := sess.Send(agent.LiveRequest{RealtimeInput: in}); err != nil {
+					t.Fatalf("Send(%T) failed: %v", in, err)
+				}
+			}
+			// Requests are sent in order, so every frame before this turn's
+			// came from the inputs. The nil Blob checks that a skipped
+			// RealtimeInput does not drop the Content sent with it.
+			if err := sess.Send(agent.LiveRequest{Content: genai.NewContentFromText("done", "user"), RealtimeInput: (*genai.Blob)(nil)}); err != nil {
+				t.Fatalf("Send(Content) failed: %v", err)
+			}
+			var got []string
+		read:
+			for {
+				select {
+				case msg := <-frames:
+					if strings.Contains(msg, `"clientContent"`) {
+						break read
+					}
+					got = append(got, msg)
+				case <-time.After(10 * time.Second):
+					t.Fatalf("the turn after the inputs was never sent; %d other frames arrived", len(got))
+				}
+			}
+			if diff := cmp.Diff(tc.want, got); diff != "" {
+				t.Errorf("frames sent for the inputs mismatch (-want +got):\n%s", diff)
+			}
+		})
+	}
+}
+
+func TestHasRealtimeInput(t *testing.T) {
+	tests := []struct {
+		name string
+		in   any
+		want bool
+	}{
+		{"untyped nil", nil, false},
+		{"nil blob", (*genai.Blob)(nil), false},
+		{"nil activity start", (*genai.ActivityStart)(nil), false},
+		{"nil activity end", (*genai.ActivityEnd)(nil), false},
+		{"blob", &genai.Blob{}, true},
+		{"activity start", &genai.ActivityStart{}, true},
+		{"activity end", &genai.ActivityEnd{}, true},
+		// Passed on, so that SendRealtime reports it as unsupported.
+		{"unsupported type", genai.Blob{}, true},
+		{"nil unsupported pointer", (*genai.Content)(nil), true},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := hasRealtimeInput(tc.in); got != tc.want {
+				t.Errorf("hasRealtimeInput(%T) = %v, want %v", tc.in, got, tc.want)
+			}
+		})
+	}
+}
+
+type longRunningMockTool struct{ mockFunctionTool }
+
+func (*longRunningMockTool) IsLongRunning() bool { return true }
+
+// TestRunLiveMarksLongRunningCalls checks that a call to a long-running tool
+// received in live mode is recorded with its ID in LongRunningToolIDs. The
+// tool returns no response, so without the marker prompt assembly would treat
+// the pending call as unanswered and drop it on a later turn.
+func TestRunLiveMarksLongRunningCalls(t *testing.T) {
+	const toolCall = `{"toolCall":{"functionCalls":[{"id":"lr_1","name":"long_job","args":{}},{"id":"plain_1","name":"plain_job","args":{}}]}}`
+	client, _ := startFakeLiveServer(t, func(connNum int, conn *websocket.Conn) {
+		if err := conn.WriteMessage(websocket.TextMessage, []byte(toolCall)); err != nil {
+			t.Errorf("writing toolCall failed: %v", err)
+			return
+		}
+		blockUntilClientCloses(conn)
+	})
+
+	f := &Flow{
+		Model:             &fakeLiveModel{client: client},
+		RequestProcessors: []func(ctx agent.InvocationContext, req *model.LLMRequest, f *Flow) iter.Seq2[*session.Event, error]{liveConfigProcessor},
+		Tools: []tool.Tool{
+			&longRunningMockTool{mockFunctionTool{name: "long_job"}},
+			&mockFunctionTool{name: "plain_job", runFunc: func(agent.Context, map[string]any) (map[string]any, error) {
+				return map[string]any{"ok": true}, nil
+			}},
+		},
+	}
+	ctx, cancel := newLiveInvocationContext(t)
+	defer cancel()
+
+	sess, seq, err := f.RunLive(ctx)
+	if err != nil {
+		t.Fatalf("RunLive failed: %v", err)
+	}
+	defer func() { _ = sess.Close() }()
+	next, stop := iter.Pull2(seq)
+	defer stop()
+
+	for {
+		ev, err, ok := next()
+		if !ok {
+			t.Fatal("iterator ended before the function call event")
+		}
+		if err != nil {
+			t.Fatalf("RunLive yielded an error: %v", err)
+		}
+		if ev == nil || len(utils.FunctionCalls(ev.LLMResponse.Content)) == 0 {
+			continue
+		}
+		if diff := cmp.Diff([]string{"lr_1"}, ev.LongRunningToolIDs); diff != "" {
+			t.Errorf("LongRunningToolIDs mismatch (-want +got):\n%s", diff)
+		}
+		return
+	}
 }
